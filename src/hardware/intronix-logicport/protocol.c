@@ -208,8 +208,10 @@ static int read_raw(struct dev_context *devc, uint8_t *buf, size_t len,
 			return SR_ERR_IO;
 		}
 		got += ret;
-		if (ret == 0 && g_get_monotonic_time() > deadline)
+		if (ret == 0 && g_get_monotonic_time() > deadline) {
+			sr_dbg("Read timeout (%zu of %zu bytes).", got, len);
 			return SR_ERR_TIMEOUT;
+		}
 	}
 
 	return SR_OK;
@@ -666,8 +668,10 @@ static int wait_init_done(struct dev_context *devc)
 	last = -1;
 	while (1) {
 		ret = reg_read_u8(devc, REG_INIT_COUNTER, &count);
-		if (ret != SR_OK)
+		if (ret != SR_OK) {
+			sr_dbg("Failed to read the FPGA init counter (%d).", ret);
 			return ret;
+		}
 		now = g_get_monotonic_time();
 		if (count != last) {
 			last = count;
@@ -717,6 +721,7 @@ static uint8_t *load_firmware(struct sr_context *ctx, int image, size_t *size)
 SR_PRIV int logicport_configure_fpga(struct sr_context *ctx,
 	struct dev_context *devc, int image)
 {
+	const char *step;
 	uint8_t *fw;
 	size_t size;
 	int i, ret;
@@ -730,13 +735,17 @@ SR_PRIV int logicport_configure_fpga(struct sr_context *ctx,
 
 	sr_info("Configuring FPGA with '%s'.", firmware_files[image]);
 	ret = SR_ERR;
+	step = "none";
 	devc->threshold_dac = -1;
 	for (i = 0; i < CONFIG_RETRIES; i++) {
 		if (i > 0) {
+			sr_dbg("Configuration attempt %d failed (%s).", i, step);
 			g_usleep(500 * 1000);
+			/* The image may have loaded, only the link failed. */
 			if (logicport_resync(devc, TRUE, 1) == SR_OK &&
 			    logicport_probe_image(devc) == SR_OK &&
-			    devc->fpga_image == image) {
+			    devc->fpga_image == image &&
+			    wait_init_done(devc) == SR_OK) {
 				ret = SR_OK;
 				break;
 			}
@@ -753,22 +762,25 @@ SR_PRIV int logicport_configure_fpga(struct sr_context *ctx,
 			sr_dbg("No ack for 'enable configure'.");
 		devc->fpga_image = -1;
 
+		step = "bit-bang";
 		ret = bitbang_configure(devc, fw, size);
 		if (ret != SR_OK)
 			continue;
 		/* A close/reopen is needed before the resync here. */
+		step = "resync";
 		ret = logicport_resync(devc, TRUE, RESYNC_RETRIES);
 		if (ret != SR_OK)
 			continue;
+		step = "init";
 		ret = wait_init_done(devc);
 		if (ret != SR_OK)
 			continue;
+		step = "image check";
 		ret = logicport_probe_image(devc);
 		if (ret == SR_OK && devc->fpga_image != image)
 			ret = SR_ERR;
 		if (ret == SR_OK)
 			break;
-		sr_dbg("Configuration attempt %d failed.", i + 1);
 	}
 	g_free(fw);
 
