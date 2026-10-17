@@ -22,14 +22,122 @@
 
 #include <stdint.h>
 #include <glib.h>
+#include <ftdi.h>
 #include <libsigrok/libsigrok.h>
 #include "libsigrok-internal.h"
 
 #define LOG_PREFIX "intronix-logicport"
 
-struct dev_context {
+#define LOGICPORT_USB_VENDOR		0x0403
+#define LOGICPORT_USB_PRODUCT		0xdc48
+#define LOGICPORT_USB_DESC		"LogicPort Logic Analyzer"
+
+/* D0..D31, CLK1, CLK2. Bit k of a sample is channel k. */
+#define LOGICPORT_NUM_CHANNELS		34
+#define LOGICPORT_ALL_CHANNELS		((UINT64_C(1) << LOGICPORT_NUM_CHANNELS) - 1)
+#define LOGICPORT_UNITSIZE		5
+#define LOGICPORT_MEM_DEPTH		2048
+
+/* Channel indices of the two clock inputs. */
+#define LOGICPORT_CH_CLK1		32
+#define LOGICPORT_CH_CLK2		33
+
+/* The threshold DAC covers -6 V .. +6 V in 50 mV steps. */
+#define LOGICPORT_THRESHOLD_MIN		-6.0
+#define LOGICPORT_THRESHOLD_MAX		6.0
+#define LOGICPORT_THRESHOLD_STEP	0.05
+
+/* Compression (RLE) is only available up to this samplerate. */
+#define LOGICPORT_RLE_MAX_RATE		SR_MHZ(200)
+
+/* Upper bound for RLE expansion when no sample limit was set. */
+#define LOGICPORT_RLE_DEFAULT_LIMIT	(16 * 1024 * 1024)
+
+/* FPGA configuration images, the index is reported by REG_IMAGE_ID. */
+enum logicport_image {
+	IMAGE_STATE_AFTER = 0,
+	IMAGE_STATE_BEFORE_CLK1_RISE = 1,
+	IMAGE_STATE_BEFORE_CLK2_RISE = 2,
+	IMAGE_STATE_BEFORE_CLK1_FALL = 3,
+	IMAGE_STATE_BEFORE_CLK2_FALL = 4,
+	IMAGE_STATE_ON = 5,
+	IMAGE_TIMING_DDR = 6,
+	IMAGE_TIMING_SDR = 7,
+	IMAGE_COUNT,
 };
 
-SR_PRIV int intronix_logicport_receive_data(int fd, int revents, void *cb_data);
+/* Samplerate table entry: prescaler (c) and 1-2-5 step (d) registers. */
+struct logicport_rate {
+	uint64_t samplerate;
+	gboolean ddr;
+	uint8_t prescaler;
+	uint8_t step;
+};
+
+struct logicport_trigger_level {
+	uint64_t pattern_mask;
+	uint64_t pattern_value;
+	uint64_t rising_mask;
+	uint64_t falling_mask;
+	uint8_t condition;
+	uint8_t counter_source;
+	uint8_t counter_mode;
+};
+
+struct dev_context {
+	struct ftdi_context *ftdic;
+	uint8_t usb_bus;
+	uint8_t usb_address;
+
+	/* Register protocol state. */
+	uint16_t seq;
+	int segment;
+	gboolean io_error;
+	int fpga_image;
+	int threshold_cal;
+	int threshold_dac;
+
+	/* User settings. */
+	const struct logicport_rate *rate;
+	uint64_t limit_samples;
+	uint64_t capture_ratio;
+	double threshold;
+	gboolean rle;
+	gboolean external_clock;
+	int clock_source;
+	int clock_edge;
+
+	/* Acquisition state. */
+	gboolean acq_running;
+	gint64 acq_start;
+	gint64 trigger_seen;
+	gint64 prefill_us;
+	gint64 postfill_us;
+	gboolean prefill_ended;
+	gboolean postfill_ended;
+	gboolean trigger_used;
+	struct logicport_trigger_level trigger[2];
+	uint8_t trigger_combine;
+	uint8_t raw[5][LOGICPORT_MEM_DEPTH];
+	uint8_t send_buf[4096 * LOGICPORT_UNITSIZE];
+};
+
+extern const struct logicport_rate logicport_rates[];
+extern const size_t logicport_rates_count;
+
+SR_PRIV int logicport_open(struct dev_context *devc);
+SR_PRIV void logicport_close(struct dev_context *devc);
+SR_PRIV int logicport_resync(struct dev_context *devc, gboolean reopen,
+	int attempts);
+SR_PRIV int logicport_probe_image(struct dev_context *devc);
+SR_PRIV int logicport_read_calibration(struct dev_context *devc);
+SR_PRIV int logicport_configure_fpga(struct sr_context *ctx,
+	struct dev_context *devc, int image);
+SR_PRIV int logicport_select_image(const struct dev_context *devc);
+SR_PRIV int logicport_convert_trigger(const struct sr_dev_inst *sdi);
+SR_PRIV int logicport_program(struct dev_context *devc);
+SR_PRIV int logicport_start(struct dev_context *devc);
+SR_PRIV int logicport_halt(struct dev_context *devc);
+SR_PRIV int logicport_receive_data(int fd, int revents, void *cb_data);
 
 #endif
