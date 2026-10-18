@@ -46,6 +46,7 @@
 #define WRITE_ACK_TIMEOUT_MS	1000
 #define READ_TIMEOUT_MS		2000
 #define PROBE_TIMEOUT_MS	250
+#define LINK_TIMEOUT_MS		3000
 #define LATENCY_TIMER_MS	4
 /* Sets the bit-bang clock for FPGA configuration, unused in FIFO mode. */
 #define BITBANG_BAUDRATE	460800
@@ -144,6 +145,7 @@
 #define BB_OUTPUTS		(BB_DATA0 | BB_DCLK | BB_NCONFIG)
 
 #define BB_CHUNK_BYTES		625	/* 10000 bit-bang bytes per write. */
+#define BB_EXTRA_CLOCKS		32
 #define FW_SIZE_MAX		(256 * 1024)
 #define RESYNC_RETRIES		5
 #define CONFIG_RETRIES		3
@@ -581,6 +583,19 @@ static int send_bitstream(struct dev_context *devc, const uint8_t *rbf,
 	return SR_OK;
 }
 
+static int send_extra_clocks(struct dev_context *devc)
+{
+	uint8_t buf[2 * BB_EXTRA_CLOCKS];
+	size_t i;
+
+	for (i = 0; i < BB_EXTRA_CLOCKS; i++) {
+		buf[2 * i] = BB_NCONFIG;
+		buf[2 * i + 1] = BB_NCONFIG | BB_DCLK;
+	}
+
+	return write_raw(devc, buf, sizeof(buf));
+}
+
 static int bitbang_configure(struct dev_context *devc, const uint8_t *rbf,
 	size_t size)
 {
@@ -620,6 +635,11 @@ static int bitbang_configure(struct dev_context *devc, const uint8_t *rbf,
 		return SR_ERR_TIMEOUT;
 	}
 
+	/* Cyclone devices need extra DCLK edges to start initialization. */
+	ret = send_extra_clocks(devc);
+	if (ret != SR_OK)
+		return ret;
+
 	if (ftdi_set_bitmode(devc->ftdic, 0, BITMODE_RESET) < 0) {
 		sr_err("Failed to leave bit-bang mode: %s.",
 			ftdi_get_error_string(devc->ftdic));
@@ -627,6 +647,29 @@ static int bitbang_configure(struct dev_context *devc, const uint8_t *rbf,
 	}
 
 	return SR_OK;
+}
+
+/*
+ * After a power-on configuration the FPGA was seen to ignore commands
+ * for more than a second, while a reconfiguration answers right away.
+ * Poll with short timeouts, resyncing in between.
+ */
+static int wait_link(struct dev_context *devc)
+{
+	gint64 deadline;
+	uint8_t count;
+
+	deadline = g_get_monotonic_time() + LINK_TIMEOUT_MS * 1000;
+	while (1) {
+		if (reg_read_timeout(devc, REG_INIT_COUNTER, &count, 1,
+		    PROBE_TIMEOUT_MS) == SR_OK)
+			return SR_OK;
+		if (g_get_monotonic_time() > deadline)
+			return SR_ERR_TIMEOUT;
+		sr_dbg("FPGA not answering yet, resyncing.");
+		g_usleep(100 * 1000);
+		logicport_resync(devc, TRUE, 1);
+	}
 }
 
 /*
@@ -746,6 +789,10 @@ SR_PRIV int logicport_configure_fpga(struct sr_context *ctx,
 		/* A close/reopen is needed before the resync here. */
 		step = "resync";
 		ret = logicport_resync(devc, TRUE, RESYNC_RETRIES);
+		if (ret != SR_OK)
+			continue;
+		step = "link";
+		ret = wait_link(devc);
 		if (ret != SR_OK)
 			continue;
 		step = "init";
