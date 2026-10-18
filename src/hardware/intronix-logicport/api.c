@@ -435,7 +435,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		return ret;
 
 	ret = prepare(sdi);
-	if (ret != SR_OK) {
+	if (ret == SR_ERR_IO || ret == SR_ERR_TIMEOUT) {
 		/* The link may be out of step, resync and try once more. */
 		sr_dbg("Retrying acquisition setup after resync.");
 		if (logicport_resync(devc, TRUE, 1) == SR_OK)

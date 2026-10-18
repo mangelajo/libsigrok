@@ -144,9 +144,18 @@
 #define BB_CONF_DONE		(1 << 4)
 #define BB_OUTPUTS		(BB_DATA0 | BB_DCLK | BB_NCONFIG)
 
-#define BB_CHUNK_BYTES		625	/* 10000 bit-bang bytes per write. */
+#define BB_CHUNK_BYTES		10000
 #define BB_EXTRA_CLOCKS		32
-#define FW_SIZE_MAX		(256 * 1024)
+/*
+ * LogicPort.ccf from the vendor software, used unmodified. A text line of
+ * nine XOR obfuscated decimal numbers (eight image sizes in 16 byte units
+ * and their XOR) is followed by the images, each a ready bit-bang stream
+ * whose first two 4 KiB blocks are swapped.
+ */
+#define FW_FILE			"intronix-logicport.ccf"
+#define CCF_KEY			0x916662
+#define CCF_HEADER_MAX		128
+#define CCF_SWAP_BLOCK		4096
 #define RESYNC_RETRIES		5
 #define CONFIG_RETRIES		3
 
@@ -160,15 +169,15 @@
 #  define PURGE_FTDI_RX ftdi_usb_purge_tx_buffer
 #endif
 
-static const char *firmware_files[IMAGE_COUNT] = {
-	[IMAGE_STATE_AFTER] = "intronix-logicport-state-after.rbf",
-	[IMAGE_STATE_BEFORE_CLK1_RISE] = "intronix-logicport-state-before-clk1-rise.rbf",
-	[IMAGE_STATE_BEFORE_CLK2_RISE] = "intronix-logicport-state-before-clk2-rise.rbf",
-	[IMAGE_STATE_BEFORE_CLK1_FALL] = "intronix-logicport-state-before-clk1-fall.rbf",
-	[IMAGE_STATE_BEFORE_CLK2_FALL] = "intronix-logicport-state-before-clk2-fall.rbf",
-	[IMAGE_STATE_ON] = "intronix-logicport-state-on.rbf",
-	[IMAGE_TIMING_DDR] = "intronix-logicport-timing-ddr.rbf",
-	[IMAGE_TIMING_SDR] = "intronix-logicport-timing-sdr.rbf",
+static const char *image_names[IMAGE_COUNT] = {
+	[IMAGE_STATE_AFTER] = "state-after",
+	[IMAGE_STATE_BEFORE_CLK1_RISE] = "state-before-clk1-rise",
+	[IMAGE_STATE_BEFORE_CLK2_RISE] = "state-before-clk2-rise",
+	[IMAGE_STATE_BEFORE_CLK1_FALL] = "state-before-clk1-fall",
+	[IMAGE_STATE_BEFORE_CLK2_FALL] = "state-before-clk2-fall",
+	[IMAGE_STATE_ON] = "state-on",
+	[IMAGE_TIMING_DDR] = "timing-ddr",
+	[IMAGE_TIMING_SDR] = "timing-sdr",
 };
 
 SR_PRIV const struct logicport_rate logicport_rates[] = {
@@ -554,25 +563,16 @@ static int wait_pins(struct dev_context *devc, uint8_t mask)
 	return SR_ERR_TIMEOUT;
 }
 
-/* Clock an RBF image into the FPGA, LSB first, two bytes per bit. */
-static int send_bitstream(struct dev_context *devc, const uint8_t *rbf,
+/* Send a bit-bang stream: two bytes per bit, DCLK low then high. */
+static int send_bitstream(struct dev_context *devc, const uint8_t *stream,
 	size_t size)
 {
-	uint8_t buf[BB_CHUNK_BYTES * 16], *p, bit;
-	size_t off, len, i;
-	int j, ret;
+	size_t off, len;
+	int ret;
 
 	for (off = 0; off < size; off += len) {
 		len = MIN(size - off, BB_CHUNK_BYTES);
-		p = buf;
-		for (i = 0; i < len; i++) {
-			for (j = 0; j < 8; j++) {
-				bit = (rbf[off + i] >> j) & 1;
-				*p++ = BB_NCONFIG | bit;
-				*p++ = BB_NCONFIG | BB_DCLK | bit;
-			}
-		}
-		ret = write_raw(devc, buf, p - buf);
+		ret = write_raw(devc, stream + off, len);
 		if (ret != SR_OK)
 			return ret;
 		/* The bit-bang echo is of no use, don't let it pile up. */
@@ -596,7 +596,7 @@ static int send_extra_clocks(struct dev_context *devc)
 	return write_raw(devc, buf, sizeof(buf));
 }
 
-static int bitbang_configure(struct dev_context *devc, const uint8_t *rbf,
+static int bitbang_configure(struct dev_context *devc, const uint8_t *stream,
 	size_t size)
 {
 	uint8_t pin_state;
@@ -626,7 +626,7 @@ static int bitbang_configure(struct dev_context *devc, const uint8_t *rbf,
 		return SR_ERR_TIMEOUT;
 	}
 
-	ret = send_bitstream(devc, rbf, size);
+	ret = send_bitstream(devc, stream, size);
 	if (ret != SR_OK)
 		return ret;
 
@@ -710,32 +710,145 @@ static int wait_init_done(struct dev_context *devc)
 	return SR_OK;
 }
 
-static uint8_t *load_firmware(struct sr_context *ctx, int image, size_t *size)
+static int read_full(struct sr_context *ctx, struct sr_resource *res,
+	uint8_t *buf, size_t len)
 {
-	static const uint8_t rbf_sync = 0x6a;
-	const char *name;
-	uint8_t *fw;
-	size_t i;
+	gssize n;
 
-	name = firmware_files[image];
-	fw = sr_resource_load(ctx, SR_RESOURCE_FIRMWARE, name, size,
-		FW_SIZE_MAX);
-	if (!fw) {
+	while (len) {
+		n = sr_resource_read(ctx, res, buf, len);
+		if (n <= 0)
+			return SR_ERR_IO;
+		buf += n;
+		len -= n;
+	}
+
+	return SR_OK;
+}
+
+static int parse_ccf_header(const char *line, uint32_t *units)
+{
+	gchar **fields;
+	uint32_t check;
+	int i, ret;
+
+	fields = g_strsplit(line, ",", 0);
+	ret = SR_OK;
+	if (g_strv_length(fields) != IMAGE_COUNT + 1)
+		ret = SR_ERR_DATA;
+	check = 0;
+	for (i = 0; ret == SR_OK && i <= IMAGE_COUNT; i++) {
+		units[i] = strtoul(fields[i], NULL, 10) ^ CCF_KEY;
+		if (i < IMAGE_COUNT)
+			check ^= units[i];
+	}
+	if (ret == SR_OK && check != units[IMAGE_COUNT])
+		ret = SR_ERR_DATA;
+	g_strfreev(fields);
+
+	return ret;
+}
+
+/* The stream must start with an Altera RBF header: 16 x 0xff, 0x6a. */
+static gboolean stream_is_rbf(const uint8_t *stream, size_t size)
+{
+	static const uint8_t sync = 0x6a;
+	uint8_t byte;
+	size_t i, k;
+
+	if (size < 17 * 16)
+		return FALSE;
+	for (i = 0; i < 17; i++) {
+		byte = 0;
+		for (k = 0; k < 8; k++)
+			byte |= (stream[(i * 8 + k) * 2] & BB_DATA0) << k;
+		if (byte != (i < 16 ? 0xff : sync))
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+/* Read one image from LogicPort.ccf, ready to bit-bang. */
+static uint8_t *load_image(struct sr_context *ctx, int image, size_t *size)
+{
+	struct sr_resource res;
+	char line[CCF_HEADER_MAX];
+	uint32_t units[IMAGE_COUNT + 1];
+	uint8_t *stream, skip[4096], tmp;
+	uint64_t offset, total;
+	size_t len, i;
+	int k;
+
+	if (sr_resource_open(ctx, &res, SR_RESOURCE_FIRMWARE, FW_FILE) != SR_OK) {
 		sr_err("Firmware file '%s' not found, see README.devices.",
-			name);
+			FW_FILE);
 		return NULL;
 	}
 
-	for (i = 0; i < 16 && i < *size; i++)
-		if (fw[i] != 0xff)
+	/* Header line, terminated by CR LF. */
+	len = 0;
+	while (len < sizeof(line) - 1) {
+		if (read_full(ctx, &res, (uint8_t *)&line[len], 1) != SR_OK)
 			break;
-	if (i != 16 || *size < 17 || fw[16] != rbf_sync) {
-		sr_err("Firmware file '%s' is not an RBF image.", name);
-		g_free(fw);
+		if (line[len++] == '\n')
+			break;
+	}
+	line[len] = '\0';
+	if (len < 2 || line[len - 1] != '\n' ||
+	    parse_ccf_header(line, units) != SR_OK) {
+		sr_err("'%s' is not a LogicPort.ccf file.", FW_FILE);
+		goto err_close;
+	}
+
+	offset = 0;
+	total = 0;
+	for (k = 0; k < IMAGE_COUNT; k++) {
+		if (k < image)
+			offset += (uint64_t)units[k] * 16;
+		total += (uint64_t)units[k] * 16;
+	}
+	*size = (size_t)units[image] * 16;
+	if (len + total != res.size || *size < 2 * CCF_SWAP_BLOCK) {
+		sr_err("'%s' has an unexpected size.", FW_FILE);
+		goto err_close;
+	}
+
+	for (; offset; offset -= len) {
+		len = MIN(offset, sizeof(skip));
+		if (read_full(ctx, &res, skip, len) != SR_OK)
+			goto err_read;
+	}
+	stream = g_try_malloc(*size);
+	if (!stream) {
+		sr_err("Failed to allocate memory for the bitstream.");
+		goto err_close;
+	}
+	if (read_full(ctx, &res, stream, *size) != SR_OK) {
+		g_free(stream);
+		goto err_read;
+	}
+	sr_resource_close(ctx, &res);
+
+	for (i = 0; i < CCF_SWAP_BLOCK; i++) {
+		tmp = stream[i];
+		stream[i] = stream[CCF_SWAP_BLOCK + i];
+		stream[CCF_SWAP_BLOCK + i] = tmp;
+	}
+	if (!stream_is_rbf(stream, *size)) {
+		sr_err("Image %d in '%s' is not a valid bitstream.", image,
+			FW_FILE);
+		g_free(stream);
 		return NULL;
 	}
 
-	return fw;
+	return stream;
+
+err_read:
+	sr_err("Failed to read '%s'.", FW_FILE);
+err_close:
+	sr_resource_close(ctx, &res);
+	return NULL;
 }
 
 SR_PRIV int logicport_configure_fpga(struct sr_context *ctx,
@@ -749,11 +862,11 @@ SR_PRIV int logicport_configure_fpga(struct sr_context *ctx,
 	if (devc->fpga_image == image)
 		return SR_OK;
 
-	fw = load_firmware(ctx, image, &size);
+	fw = load_image(ctx, image, &size);
 	if (!fw)
 		return SR_ERR;
 
-	sr_info("Configuring FPGA with '%s'.", firmware_files[image]);
+	sr_info("Configuring FPGA with image '%s'.", image_names[image]);
 	ret = SR_ERR;
 	step = "none";
 	devc->threshold_dac = -1;
