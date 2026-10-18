@@ -189,8 +189,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		if (conn && !conn_matches(conn_devices, curdev->dev))
 			continue;
 		sdi = scan_device(ftdic, curdev->dev);
-		if (sdi)
-			devices = g_slist_append(devices, sdi);
+		devices = g_slist_append(devices, sdi);
 	}
 
 	ftdi_list_free(&devlist);

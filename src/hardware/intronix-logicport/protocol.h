@@ -81,9 +81,8 @@ struct logicport_rate {
 
 /*
  * One of the two hardware trigger levels (A, B). Masks have one bit per
- * channel. Only the subset of the level's features that sigrok triggers
- * can express is used: patterns and edges, but no occurrence counts,
- * durations or value ranges.
+ * channel. Only patterns and edges are used, sigrok triggers have no
+ * occurrence counts, durations or value ranges.
  */
 struct logicport_trigger_level {
 	uint64_t pattern_mask;		/* Channels taking part in the pattern. */
@@ -135,7 +134,6 @@ struct dev_context {
 	uint8_t trigger_combine;
 	/* Sample memory readout: lanes D0-7 .. D24-31, then the flags lane. */
 	uint8_t raw[5][LOGICPORT_MEM_DEPTH];
-	uint8_t send_buf[4096 * LOGICPORT_UNITSIZE];
 };
 
 extern const struct logicport_rate logicport_rates[];

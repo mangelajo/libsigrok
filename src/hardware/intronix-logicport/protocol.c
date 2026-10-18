@@ -102,7 +102,7 @@
 #define REG_INIT_COUNTER	0x40000005
 
 /*
- * Status register. Note that it cannot tell "idle" from "pre-filling",
+ * Status register. It cannot tell "idle" from "pre-filling",
  * and a previous capture's "done" survives into later sessions, so the
  * driver only looks at it after having started the acquisition itself.
  */
@@ -333,34 +333,6 @@ static int reg_read(struct dev_context *devc, uint32_t addr,
 static int reg_write_u8(struct dev_context *devc, uint32_t addr, uint8_t value)
 {
 	return reg_write(devc, addr, &value, 1);
-}
-
-static int reg_write_u16(struct dev_context *devc, uint32_t addr, uint16_t value)
-{
-	uint8_t buf[2];
-
-	write_u16le(buf, value);
-
-	return reg_write(devc, addr, buf, sizeof(buf));
-}
-
-static int reg_write_u32(struct dev_context *devc, uint32_t addr, uint32_t value)
-{
-	uint8_t buf[4];
-
-	write_u32le(buf, value);
-
-	return reg_write(devc, addr, buf, sizeof(buf));
-}
-
-/* Channel masks are 34 bits wide and get sent as five bytes. */
-static int reg_write_u40(struct dev_context *devc, uint32_t addr, uint64_t value)
-{
-	uint8_t buf[5];
-
-	write_u40le(buf, value);
-
-	return reg_write(devc, addr, buf, sizeof(buf));
 }
 
 static int reg_read_u8(struct dev_context *devc, uint32_t addr, uint8_t *value)
@@ -885,25 +857,63 @@ SR_PRIV int logicport_convert_trigger(const struct sr_dev_inst *sdi)
 	return SR_OK;
 }
 
-static int write_trigger_level(struct dev_context *devc, uint32_t base,
-	const struct logicport_trigger_level *level)
+/* Settings are collected in a list, then written in order. */
+struct regval {
+	uint32_t addr;
+	size_t width;
+	uint64_t value;
+};
+
+struct reg_queue {
+	struct regval regs[48];
+	size_t count;
+};
+
+static void queue_reg(struct reg_queue *q, uint32_t addr, size_t width,
+	uint64_t value)
 {
+	if (q->count < ARRAY_SIZE(q->regs)) {
+		q->regs[q->count].addr = addr;
+		q->regs[q->count].width = width;
+		q->regs[q->count].value = value;
+	}
+	q->count++;
+}
+
+static int write_regs(struct dev_context *devc, const struct reg_queue *q)
+{
+	uint8_t buf[8];
+	size_t i;
 	int ret;
 
-	ret = reg_write_u40(devc, base + TRIG_PATTERN_MASK, level->pattern_mask);
-	ret |= reg_write_u40(devc, base + TRIG_PATTERN_VALUE, level->pattern_value);
-	ret |= reg_write_u40(devc, base + TRIG_RISING_MASK, level->rising_mask);
-	ret |= reg_write_u40(devc, base + TRIG_FALLING_MASK, level->falling_mask);
-	ret |= reg_write_u8(devc, base + TRIG_CONSECUTIVE, 0);
-	ret |= reg_write_u8(devc, base + TRIG_PREQUALIFY, 0);
-	ret |= reg_write_u32(devc, base + TRIG_COUNT_LOW, 0);
-	/* Occurrence count minus one: fire on the first event. */
-	ret |= reg_write_u32(devc, base + TRIG_COUNT_HIGH, 0);
-	ret |= reg_write_u8(devc, base + TRIG_CONDITION, level->condition);
-	ret |= reg_write_u8(devc, base + TRIG_COUNTER_SOURCE, level->counter_source);
-	ret |= reg_write_u8(devc, base + TRIG_COUNTER_MODE, level->counter_mode);
+	if (q->count > ARRAY_SIZE(q->regs))
+		return SR_ERR_BUG;
 
-	return ret ? SR_ERR_IO : SR_OK;
+	for (i = 0; i < q->count; i++) {
+		write_u64le(buf, q->regs[i].value);
+		ret = reg_write(devc, q->regs[i].addr, buf, q->regs[i].width);
+		if (ret != SR_OK)
+			return ret;
+	}
+
+	return SR_OK;
+}
+
+static void queue_trigger_level(struct reg_queue *q, uint32_t base,
+	const struct logicport_trigger_level *level)
+{
+	queue_reg(q, base + TRIG_PATTERN_MASK, 5, level->pattern_mask);
+	queue_reg(q, base + TRIG_PATTERN_VALUE, 5, level->pattern_value);
+	queue_reg(q, base + TRIG_RISING_MASK, 5, level->rising_mask);
+	queue_reg(q, base + TRIG_FALLING_MASK, 5, level->falling_mask);
+	queue_reg(q, base + TRIG_CONSECUTIVE, 1, 0);
+	queue_reg(q, base + TRIG_PREQUALIFY, 1, 0);
+	queue_reg(q, base + TRIG_COUNT_LOW, 4, 0);
+	/* Occurrence count minus one: fire on the first event. */
+	queue_reg(q, base + TRIG_COUNT_HIGH, 4, 0);
+	queue_reg(q, base + TRIG_CONDITION, 1, level->condition);
+	queue_reg(q, base + TRIG_COUNTER_SOURCE, 1, level->counter_source);
+	queue_reg(q, base + TRIG_COUNTER_MODE, 1, level->counter_mode);
 }
 
 static uint16_t threshold_dac(double volts, int cal)
@@ -949,14 +959,16 @@ static void buffer_split(const struct dev_context *devc, uint16_t *pre,
 /* Write all acquisition settings, in the order the vendor software uses. */
 SR_PRIV int logicport_program(struct dev_context *devc)
 {
+	struct reg_queue q;
 	uint16_t pre, post, dac;
 	uint8_t mode;
 	int ret;
 
-	ret = SR_OK;
+	q.count = 0;
+
 	if (!devc->external_clock) {
-		ret |= reg_write_u8(devc, REG_PRESCALER, devc->rate->prescaler);
-		ret |= reg_write_u8(devc, REG_STEP, devc->rate->step);
+		queue_reg(&q, REG_PRESCALER, 1, devc->rate->prescaler);
+		queue_reg(&q, REG_STEP, 1, devc->rate->step);
 		mode = CLOCK_MODE_CLK1 | CLOCK_MODE_NO_QUAL;
 	} else {
 		mode = CLOCK_MODE_NO_QUAL;
@@ -965,29 +977,30 @@ SR_PRIV int logicport_program(struct dev_context *devc)
 			mode |= CLOCK_MODE_FALLING;
 	}
 
-	ret |= reg_write_u8(devc, REG_CLOCK_MODE, mode);
-	ret |= reg_write_u8(devc, REG_COMPRESSION, 0);
+	queue_reg(&q, REG_CLOCK_MODE, 1, mode);
+	queue_reg(&q, REG_COMPRESSION, 1, 0);
 	/* All channels are always captured, this only steers compression. */
-	ret |= reg_write_u40(devc, REG_COMPRESSION_MASK, LOGICPORT_ALL_CHANNELS);
-	ret |= reg_write_u40(devc, REG_INVERT_MASK, 0);
-	ret |= reg_write_u8(devc, REG_COMPRESSION, devc->rle ? 1 : 0);
-	ret |= reg_write_u8(devc, REG_CHANNEL_CFG, 0);
+	queue_reg(&q, REG_COMPRESSION_MASK, 5, LOGICPORT_ALL_CHANNELS);
+	queue_reg(&q, REG_INVERT_MASK, 5, 0);
+	queue_reg(&q, REG_COMPRESSION, 1, devc->rle ? 1 : 0);
+	queue_reg(&q, REG_CHANNEL_CFG, 1, 0);
 
-	ret |= reg_write_u8(devc, REG_RUN, 0);
-	ret |= reg_write_u8(devc, REG_ARM, 1);
-	ret |= write_trigger_level(devc, REG_TRIGGER_LEVEL_A, &devc->trigger[0]);
-	ret |= write_trigger_level(devc, REG_TRIGGER_LEVEL_B, &devc->trigger[1]);
-	ret |= reg_write_u8(devc, REG_TRIGGER_COMBINE, devc->trigger_combine);
+	queue_reg(&q, REG_RUN, 1, 0);
+	queue_reg(&q, REG_ARM, 1, 1);
+	queue_trigger_level(&q, REG_TRIGGER_LEVEL_A, &devc->trigger[0]);
+	queue_trigger_level(&q, REG_TRIGGER_LEVEL_B, &devc->trigger[1]);
+	queue_reg(&q, REG_TRIGGER_COMBINE, 1, devc->trigger_combine);
 
 	dac = threshold_dac(devc->threshold, devc->threshold_cal);
-	ret |= reg_write_u16(devc, REG_THRESHOLD, dac);
+	queue_reg(&q, REG_THRESHOLD, 2, dac);
 
 	buffer_split(devc, &pre, &post);
-	ret |= reg_write_u16(devc, REG_PRE_DEPTH, pre);
-	ret |= reg_write_u16(devc, REG_POST_DEPTH, post);
+	queue_reg(&q, REG_PRE_DEPTH, 2, pre);
+	queue_reg(&q, REG_POST_DEPTH, 2, post);
 
-	if (ret)
-		return SR_ERR_IO;
+	ret = write_regs(devc, &q);
+	if (ret != SR_OK)
+		return ret;
 
 	if (dac != devc->threshold_dac) {
 		sr_dbg("Waiting for the threshold DAC (%u) to settle.", dac);
@@ -1068,12 +1081,9 @@ SR_PRIV int logicport_halt(struct dev_context *devc)
 	return reg_write_u8(devc, REG_RUN, 0);
 }
 
-/* Accumulates samples into SR_DF_LOGIC packets, places the trigger. */
+/* Feeds expanded samples to the session, applies limit and trigger. */
 struct sample_sink {
-	const struct sr_dev_inst *sdi;
-	uint8_t *buf;
-	size_t fill;
-	size_t capacity;
+	struct feed_queue_logic *queue;
 	uint64_t skip;
 	uint64_t sent;
 	uint64_t limit;
@@ -1100,50 +1110,29 @@ static void sink_set_trigger(struct sample_sink *sink, int64_t trigger,
 	sink->trigger -= sink->skip;
 }
 
-static void sink_flush(struct sample_sink *sink)
-{
-	struct sr_datafeed_packet packet;
-	struct sr_datafeed_logic logic;
-
-	if (!sink->fill)
-		return;
-
-	logic.length = sink->fill * LOGICPORT_UNITSIZE;
-	logic.unitsize = LOGICPORT_UNITSIZE;
-	logic.data = sink->buf;
-	packet.type = SR_DF_LOGIC;
-	packet.payload = &logic;
-	sr_session_send(sink->sdi, &packet);
-	sink->fill = 0;
-}
-
 static void sink_put(struct sample_sink *sink, uint64_t value, uint64_t count)
 {
-	uint64_t chunk, i;
+	uint8_t sample[LOGICPORT_UNITSIZE];
+	uint64_t chunk;
 
 	chunk = MIN(count, sink->skip);
 	sink->skip -= chunk;
 	count -= chunk;
 
+	write_u40le(sample, value);
 	while (count && (!sink->limit || sink->sent < sink->limit)) {
 		if (sink->trigger >= 0 && sink->sent == (uint64_t)sink->trigger) {
-			sink_flush(sink);
-			std_session_send_df_trigger(sink->sdi);
+			feed_queue_logic_send_trigger(sink->queue);
 			sink->trigger = -1;
 		}
-		chunk = MIN(count, sink->capacity - sink->fill);
+		chunk = count;
 		if (sink->trigger >= 0)
 			chunk = MIN(chunk, (uint64_t)sink->trigger - sink->sent);
 		if (sink->limit)
 			chunk = MIN(chunk, sink->limit - sink->sent);
-		for (i = 0; i < chunk; i++)
-			write_u40le(&sink->buf[(sink->fill + i) * LOGICPORT_UNITSIZE],
-				value);
-		sink->fill += chunk;
+		feed_queue_logic_submit_one(sink->queue, sample, chunk);
 		sink->sent += chunk;
 		count -= chunk;
-		if (sink->fill == sink->capacity)
-			sink_flush(sink);
 	}
 }
 
@@ -1357,9 +1346,9 @@ static int read_samples(const struct sr_dev_inst *sdi, uint8_t status)
 	devc = sdi->priv;
 
 	memset(&sink, 0, sizeof(sink));
-	sink.sdi = sdi;
-	sink.buf = devc->send_buf;
-	sink.capacity = sizeof(devc->send_buf) / LOGICPORT_UNITSIZE;
+	sink.queue = feed_queue_logic_alloc(sdi, 4096, LOGICPORT_UNITSIZE);
+	if (!sink.queue)
+		return SR_ERR_MALLOC;
 	sink.limit = devc->limit_samples;
 	sink.ratio = devc->capture_ratio;
 	sink.trigger = -1;
@@ -1370,7 +1359,8 @@ static int read_samples(const struct sr_dev_inst *sdi, uint8_t status)
 		ret = read_ddr(devc, status, &sink);
 	else
 		ret = read_sdr(devc, status, &sink);
-	sink_flush(&sink);
+	feed_queue_logic_flush(sink.queue);
+	feed_queue_logic_free(sink.queue);
 	sr_dbg("Sent %" PRIu64 " samples.", sink.sent);
 
 	return ret;
