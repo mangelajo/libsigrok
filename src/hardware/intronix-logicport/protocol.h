@@ -53,7 +53,12 @@
 /* Upper bound for RLE expansion when no sample limit was set. */
 #define LOGICPORT_RLE_DEFAULT_LIMIT	(16 * 1024 * 1024)
 
-/* FPGA configuration images, the index is reported by REG_IMAGE_ID. */
+/*
+ * FPGA configuration images, one per sampling mode. The loaded image's
+ * index can be read back from the FPGA. In state mode, the image fixes
+ * where data is sampled relative to the external clock edge (2.5ns
+ * before, on, or after it); the "before" images also fix clock and edge.
+ */
 enum logicport_image {
 	IMAGE_STATE_AFTER = 0,
 	IMAGE_STATE_BEFORE_CLK1_RISE = 1,
@@ -74,14 +79,20 @@ struct logicport_rate {
 	uint8_t step;
 };
 
+/*
+ * One of the two hardware trigger levels (A, B). Masks have one bit per
+ * channel. Only the subset of the level's features that sigrok triggers
+ * can express is used: patterns and edges, but no occurrence counts,
+ * durations or value ranges.
+ */
 struct logicport_trigger_level {
-	uint64_t pattern_mask;
-	uint64_t pattern_value;
+	uint64_t pattern_mask;		/* Channels taking part in the pattern. */
+	uint64_t pattern_value;		/* Their required levels. */
 	uint64_t rising_mask;
 	uint64_t falling_mask;
-	uint8_t condition;
-	uint8_t counter_source;
-	uint8_t counter_mode;
+	uint8_t condition;		/* Pattern true / false / unused. */
+	uint8_t counter_source;		/* Event counted, e.g. edges. */
+	uint8_t counter_mode;		/* How the count is evaluated. */
 };
 
 struct dev_context {
@@ -90,16 +101,17 @@ struct dev_context {
 	uint8_t usb_address;
 
 	/* Register protocol state. */
-	uint16_t seq;
-	int segment;
-	gboolean io_error;
-	int fpga_image;
-	int threshold_cal;
-	int threshold_dac;
+	uint16_t seq;			/* Expected sequence number of the next ack. */
+	int segment;			/* Selected address segment, -1: unknown. */
+	gboolean io_error;		/* Link out of step, cleared by a resync. */
+	int fpga_image;			/* Loaded image, -1: unknown or none. */
+	int threshold_cal;		/* DAC offset, from the EEPROM. */
+	int threshold_dac;		/* Last DAC value written, -1: unknown. */
 
 	/* User settings. */
 	const struct logicport_rate *rate;
 	uint64_t limit_samples;
+	uint64_t limit_frames;
 	uint64_t capture_ratio;
 	double threshold;
 	gboolean rle;
@@ -109,15 +121,19 @@ struct dev_context {
 
 	/* Acquisition state. */
 	gboolean acq_running;
+	uint64_t frames_done;
+	/* RLE only: time limits for the pre-/post-trigger fill phases. */
 	gint64 acq_start;
 	gint64 trigger_seen;
 	gint64 prefill_us;
 	gint64 postfill_us;
 	gboolean prefill_ended;
 	gboolean postfill_ended;
+	/* Trigger levels A and B, and how they combine. */
 	gboolean trigger_used;
 	struct logicport_trigger_level trigger[2];
 	uint8_t trigger_combine;
+	/* Sample memory readout: lanes D0-7 .. D24-31, then the flags lane. */
 	uint8_t raw[5][LOGICPORT_MEM_DEPTH];
 	uint8_t send_buf[4096 * LOGICPORT_UNITSIZE];
 };

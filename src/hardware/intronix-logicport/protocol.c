@@ -101,6 +101,11 @@
 
 #define REG_INIT_COUNTER	0x40000005
 
+/*
+ * Status register. Note that it cannot tell "idle" from "pre-filling",
+ * and a previous capture's "done" survives into later sessions, so the
+ * driver only looks at it after having started the acquisition itself.
+ */
 #define STATUS_DONE		(1 << 0)
 #define STATUS_WRAPPED		(1 << 1)
 #define STATUS_TRIGGERED	(1 << 5)
@@ -941,6 +946,7 @@ static void buffer_split(const struct dev_context *devc, uint16_t *pre,
 	*post = post_depth;
 }
 
+/* Write all acquisition settings, in the order the vendor software uses. */
 SR_PRIV int logicport_program(struct dev_context *devc)
 {
 	uint16_t pre, post, dac;
@@ -1141,6 +1147,12 @@ static void sink_put(struct sample_sink *sink, uint64_t value, uint64_t count)
 	}
 }
 
+/*
+ * Sample memory has 2048 entries of 40 bits: four lanes holding D0-D31
+ * and a flags lane holding CLK1/CLK2. With compression, an entry with
+ * FLAG_COUNT set is a count record instead: the lanes and the low flag
+ * bits form a 35-bit number of sample periods without any transition.
+ */
 static uint64_t data_record(const struct dev_context *devc, size_t row,
 	int clk_shift)
 {
@@ -1364,11 +1376,17 @@ static int read_samples(const struct sr_dev_inst *sdi, uint8_t status)
 	return ret;
 }
 
+/*
+ * Poll the status register until the capture is done, then read out the
+ * sample memory. Captures can't be streamed, the readout happens only
+ * once the whole memory (or the time limited RLE window) is filled.
+ */
 SR_PRIV int logicport_receive_data(int fd, int revents, void *cb_data)
 {
 	struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 	uint8_t status;
+	int ret;
 
 	(void)fd;
 	(void)revents;
@@ -1396,8 +1414,29 @@ SR_PRIV int logicport_receive_data(int fd, int revents, void *cb_data)
 
 	sr_dbg("Acquisition done, status 0x%02x.", status);
 	devc->acq_running = FALSE;
-	if (read_samples(sdi, status) != SR_OK)
+
+	/* With a frame limit, each capture is a frame, then re-arm. */
+	if (devc->limit_frames)
+		std_session_send_df_frame_begin(sdi);
+	ret = read_samples(sdi, status);
+	if (devc->limit_frames)
+		std_session_send_df_frame_end(sdi);
+	if (ret != SR_OK) {
 		sr_err("Failed to read sample memory.");
+		sr_dev_acquisition_stop(sdi);
+		return TRUE;
+	}
+
+	devc->frames_done++;
+	if (devc->frames_done < devc->limit_frames) {
+		if (logicport_start(devc) != SR_OK) {
+			sr_err("Failed to re-arm for the next frame.");
+			sr_dev_acquisition_stop(sdi);
+			return TRUE;
+		}
+		devc->acq_running = TRUE;
+		return TRUE;
+	}
 	sr_dev_acquisition_stop(sdi);
 
 	return TRUE;
